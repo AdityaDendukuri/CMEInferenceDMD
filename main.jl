@@ -167,45 +167,79 @@ function select_important_states(sparse_probs, max_states=500)
 end
 
 """
-Apply DMD to reconstruct the generator matrix
+Apply constrained DMD to reconstruct the generator matrix with proper CME constraints
 """
-function apply_dmd_reconstruction(reduced_data, dt; svd_threshold=1e-10)
-    println("Applying DMD...")
+function apply_constrained_dmd_reconstruction(reduced_data, dt; use_constraints=true, λ_sparse=0.01)
+    println("Applying $(use_constraints ? "constrained" : "unconstrained") DMD...")
     
-    # Form snapshot matrices
-    X = reduced_data[:, 1:end-1]
-    X_prime = reduced_data[:, 2:end]
+    if use_constraints
+        try
+            # Try to load constrained DMD module
+            if !isdefined(Main, :apply_constrained_dmd)
+                include("constrained_dmd.jl")
+            end
+            
+            # Use constrained DMD
+            G, obj_val, method = apply_constrained_dmd(reduced_data, dt, λ_sparse=λ_sparse)
+            
+            # Verify the result is a valid generator
+            n_states = size(G, 1)
+            
+            # Compute eigenvalues of exp(G*dt) for DMD compatibility
+            K = exp(Matrix(G * dt))  # Convert to dense for eigendecomposition
+            λ, Φ = eigen(K)
+            
+            println("✓ Constrained DMD completed using $method method")
+            println("  Objective value: $(round(obj_val, digits=6))")
+            
+            return G, λ, Φ, K, n_states
+            
+        catch e
+            println("⚠ Constrained DMD failed: $e")
+            println("  Falling back to unconstrained DMD")
+            use_constraints = false
+        end
+    end
     
-    println("Data matrices: X$(size(X)), X'$(size(X_prime))")
-    
-    # SVD of X
-    U, Σ, V = svd(X)
-    
-    # Determine rank
-    rank_r = sum(Σ ./ Σ[1] .> svd_threshold)
-    rank_r = min(rank_r, size(X, 2))
-    
-    println("Using rank: $rank_r")
-    
-    # Truncated SVD
-    U_r = U[:, 1:rank_r]
-    Σ_r = Diagonal(Σ[1:rank_r])
-    V_r = V[:, 1:rank_r]
-    
-    # DMD operator
-    A_tilde = U_r' * X_prime * V_r * inv(Σ_r)
-    
-    # Eigendecomposition
-    λ, W = eigen(A_tilde)
-    
-    # DMD modes and full operator
-    Φ = U_r * W
-    A_dmd = U_r * A_tilde * U_r'
-    
-    # Generator matrix (continuous time)
-    G = (A_dmd - I) / dt
-    
-    return G, λ, Φ, A_dmd, rank_r
+    if !use_constraints
+        # Original unconstrained DMD
+        X = reduced_data[:, 1:end-1]
+        X_prime = reduced_data[:, 2:end]
+        
+        println("Data matrices: X$(size(X)), X'$(size(X_prime))")
+        
+        # SVD of X
+        U, Σ, V = svd(X)
+        
+        # Determine rank
+        svd_threshold = 1e-10
+        rank_r = sum(Σ ./ Σ[1] .> svd_threshold)
+        rank_r = min(rank_r, size(X, 2))
+        
+        println("Using rank: $rank_r")
+        
+        # Truncated SVD
+        U_r = U[:, 1:rank_r]
+        Σ_r = Diagonal(Σ[1:rank_r])
+        V_r = V[:, 1:rank_r]
+        
+        # DMD operator
+        A_tilde = U_r' * X_prime * V_r * inv(Σ_r)
+        
+        # Eigendecomposition
+        λ, W = eigen(A_tilde)
+        
+        # DMD modes and full operator
+        Φ = U_r * W
+        A_dmd = U_r * A_tilde * U_r'
+        
+        # Generator matrix (continuous time)
+        G = (A_dmd - I) / dt
+        
+        println("⚠ Using unconstrained DMD - may produce unphysical reactions")
+        
+        return G, λ, Φ, A_dmd, rank_r
+    end
 end
 
 """
@@ -350,11 +384,11 @@ function format_reaction(stoich, species_names)
 end
 
 """
-Main inference function
+Main inference function with constrained DMD option
 """
-function run_mm_inference(n_trajs=500, max_states=500)
+function run_mm_inference(n_trajs=500, max_states=500; use_constrained_dmd=true, λ_sparse=0.01)
     println("="^50)
-    println("MM CRN INFERENCE")
+    println("MM CRN INFERENCE $(use_constrained_dmd ? "(CONSTRAINED DMD)" : "(UNCONSTRAINED DMD)")")
     println("="^50)
     
     # Generate data
@@ -374,14 +408,16 @@ function run_mm_inference(n_trajs=500, max_states=500)
     println("\nSelecting important states...")
     reduced_data, selected_states = select_important_states(sparse_probs, max_states)
     
-    # Apply DMD
+    # Apply DMD (constrained or unconstrained)
     println("\nApplying DMD...")
-    G, λ, Φ, A_dmd, rank_r = apply_dmd_reconstruction(reduced_data, dt)
+    G, λ, Φ, A_dmd, rank_r = apply_constrained_dmd_reconstruction(
+        reduced_data, dt, use_constraints=use_constrained_dmd, λ_sparse=λ_sparse
+    )
     
     # Extract reactions
     println("\nExtracting reactions...")
     significant_stoich, grouped_reactions, stoich_stats = extract_reactions_with_conservation(
-        G, selected_states, species_names
+        G, selected_states, species_names, apply_conservation=use_constrained_dmd
     )
     
     # Check for expected MM reactions
@@ -395,18 +431,53 @@ function run_mm_inference(n_trajs=500, max_states=500)
         (tuple([1, 1, -1, 0]...), "SE → S + E")
     ]
     
+    found_count = 0
     for (expected_stoich, description) in expected_reactions
         if expected_stoich in keys(grouped_reactions)
             stats = stoich_stats[expected_stoich]
             println("✓ $description: found (rate ≈ $(round(stats.total_rate, digits=4)))")
+            found_count += 1
         else
             println("✗ $description: not found")
         end
     end
     
+    # Check for unphysical reactions
+    println("\n" * "="^30)
+    println("UNPHYSICAL REACTION CHECK")
+    println("="^30)
+    
+    unphysical_reactions = [
+        (tuple([-1, 0, 0, 1]...), "S → P"),
+        (tuple([0, 0, 0, 1]...), "∅ → P"),
+        (tuple([-1, 0, 0, 0]...), "S → ∅"),
+        (tuple([0, -1, 0, 1]...), "E → P")
+    ]
+    
+    unphysical_found = 0
+    for (unphys_stoich, description) in unphysical_reactions
+        if unphys_stoich in keys(grouped_reactions)
+            stats = stoich_stats[unphys_stoich] 
+            println("⚠ $description: FOUND (rate ≈ $(round(stats.total_rate, digits=4))) - UNPHYSICAL!")
+            unphysical_found += 1
+        else
+            println("✓ $description: not found (good)")
+        end
+    end
+    
+    # Overall assessment
+    recovery_rate = found_count / length(expected_reactions) * 100
     println("\n" * "="^50)
-    println("INFERENCE COMPLETE")
+    println("INFERENCE ASSESSMENT")
     println("="^50)
+    println("Expected reactions recovered: $found_count/$(length(expected_reactions)) ($(round(recovery_rate, digits=1))%)")
+    println("Unphysical reactions found: $unphysical_found")
+    
+    if use_constrained_dmd && unphysical_found == 0
+        println("🎉 Constrained DMD successfully eliminated unphysical reactions!")
+    elseif !use_constrained_dmd && unphysical_found > 0
+        println("⚠ Unconstrained DMD produced unphysical reactions - try constrained version")
+    end
     
     return Dict(
         "trajectories" => trajectories,
@@ -420,7 +491,11 @@ function run_mm_inference(n_trajs=500, max_states=500)
         "selected_states" => selected_states,
         "rank" => rank_r,
         "dt" => dt,
-        "species_names" => species_names
+        "species_names" => species_names,
+        "constrained" => use_constrained_dmd,
+        "sparsity_param" => λ_sparse,
+        "recovery_rate" => recovery_rate,
+        "unphysical_count" => unphysical_found
     )
 end
 
