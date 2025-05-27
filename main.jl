@@ -167,42 +167,60 @@ function select_important_states(sparse_probs, max_states=500)
 end
 
 """
-Apply constrained DMD to reconstruct the generator matrix with proper CME constraints
+Apply multigrid constrained DMD for scalable CME generator recovery
 """
-function apply_constrained_dmd_reconstruction(reduced_data, dt; use_constraints=true, λ_sparse=0.01)
-    println("Applying $(use_constraints ? "constrained" : "unconstrained") DMD...")
+function apply_constrained_dmd_reconstruction(reduced_data, dt, selected_states, species_names; use_constraints=true, λ_sparse=0.01)
+    println("Applying $(use_constraints ? "multigrid constrained" : "unconstrained") DMD...")
     
     if use_constraints
         try
-            # Try to load constrained DMD module
-            if !isdefined(Main, :apply_constrained_dmd)
-                include("constrained_dmd.jl")
+            # Load multigrid DMD module if not already loaded
+            if !isdefined(Main, :multigrid_constrained_dmd)
+                include("multigrid_dmd.jl")
             end
             
-            # Use constrained DMD
-            G, obj_val, method = apply_constrained_dmd(reduced_data, dt, λ_sparse=λ_sparse)
+            # Apply multigrid constrained DMD with actual state information
+            G_multigrid, sorted_stoich, fused_reactions, reaction_stats, n_successful = multigrid_constrained_dmd(
+                reduced_data, dt, selected_states, species_names,
+                segment_length=6,  # Small segments for computational tractability
+                overlap_fraction=0.3
+            )
             
-            # Verify the result is a valid generator
-            n_states = size(G, 1)
-            
-            # Compute eigenvalues of exp(G*dt) for DMD compatibility
-            K = exp(Matrix(G * dt))  # Convert to dense for eigendecomposition
-            λ, Φ = eigen(K)
-            
-            println("✓ Constrained DMD completed using $method method")
-            println("  Objective value: $(round(obj_val, digits=6))")
-            
-            return G, λ, Φ, K, n_states
+            if n_successful >= 2
+                # Compute eigenvalues for compatibility with existing code
+                K_multigrid = I + G_multigrid * dt
+                λ, Φ = eigen(K_multigrid)
+                
+                println("✓ Multigrid constrained DMD completed successfully")
+                println("  Successful segments: $n_successful")
+                println("  Fused reactions: $(length(sorted_stoich))")
+                
+                # Verify constraints on the combined generator
+                println("\nVerifying multigrid CME generator:")
+                violations = count_constraint_violations(G_multigrid)
+                if violations == 0
+                    println("  ✓ All CME constraints satisfied!")
+                else
+                    println("  ⚠ $violations constraint violations remain")
+                end
+                
+                # Return multigrid-specific results
+                return G_multigrid, λ, Φ, K_multigrid, size(G_multigrid, 1), sorted_stoich, fused_reactions, reaction_stats
+            else
+                println("⚠ Insufficient successful segments, falling back to unconstrained")
+                use_constraints = false
+            end
             
         catch e
-            println("⚠ Constrained DMD failed: $e")
+            println("⚠ Multigrid constrained DMD failed: $e")
+            println("  Error details: $(sprint(showerror, e))")
             println("  Falling back to unconstrained DMD")
             use_constraints = false
         end
     end
     
     if !use_constraints
-        # Original unconstrained DMD
+        # Original unconstrained DMD (for comparison)
         X = reduced_data[:, 1:end-1]
         X_prime = reduced_data[:, 2:end]
         
@@ -216,7 +234,7 @@ function apply_constrained_dmd_reconstruction(reduced_data, dt; use_constraints=
         rank_r = sum(Σ ./ Σ[1] .> svd_threshold)
         rank_r = min(rank_r, size(X, 2))
         
-        println("Using rank: $rank_r")
+        println("Using unconstrained DMD with rank: $rank_r")
         
         # Truncated SVD
         U_r = U[:, 1:rank_r]
@@ -233,12 +251,13 @@ function apply_constrained_dmd_reconstruction(reduced_data, dt; use_constraints=
         Φ = U_r * W
         A_dmd = U_r * A_tilde * U_r'
         
-        # Generator matrix (continuous time)
+        # Generator matrix using linear approximation (THEORETICAL ISSUE!)
         G = (A_dmd - I) / dt
         
-        println("⚠ Using unconstrained DMD - may produce unphysical reactions")
+        println("⚠ Using unconstrained DMD with linear approximation")
+        println("  This may produce unphysical reactions due to invalid CME structure")
         
-        return G, λ, Φ, A_dmd, rank_r
+        return G, λ, Φ, A_dmd, rank_r, [], Dict(), Dict()
     end
 end
 
@@ -408,17 +427,46 @@ function run_mm_inference(n_trajs=500, max_states=500; use_constrained_dmd=true,
     println("\nSelecting important states...")
     reduced_data, selected_states = select_important_states(sparse_probs, max_states)
     
-    # Apply DMD (constrained or unconstrained)
+    # Apply DMD (multigrid constrained or unconstrained)
     println("\nApplying DMD...")
-    G, λ, Φ, A_dmd, rank_r = apply_constrained_dmd_reconstruction(
-        reduced_data, dt, use_constraints=use_constrained_dmd, λ_sparse=λ_sparse
+    dmd_results = apply_constrained_dmd_reconstruction(
+        reduced_data, dt, selected_states, species_names,
+        use_constraints=use_constrained_dmd, λ_sparse=λ_sparse
     )
     
-    # Extract reactions
+    # Unpack results (handle both multigrid and traditional DMD)
+    if length(dmd_results) == 8  # Multigrid results
+        G, λ, Φ, A_dmd, rank_r, multigrid_stoich, multigrid_reactions, multigrid_stats = dmd_results
+        use_multigrid_results = !isempty(multigrid_stoich)
+    else  # Traditional DMD results
+        G, λ, Φ, A_dmd, rank_r = dmd_results[1:5]
+        use_multigrid_results = false
+        multigrid_stoich, multigrid_reactions, multigrid_stats = [], Dict(), Dict()
+    end
+    
+    # Extract reactions (use multigrid results if available)
     println("\nExtracting reactions...")
-    significant_stoich, grouped_reactions, stoich_stats = extract_reactions_with_conservation(
-        G, selected_states, species_names, apply_conservation=use_constrained_dmd
-    )
+    if use_multigrid_results
+        println("Using multigrid fusion results...")
+        significant_stoich = multigrid_stoich
+        grouped_reactions = multigrid_reactions
+        
+        # Convert multigrid stats to traditional format
+        stoich_stats = Dict()
+        for (stoich, stats) in multigrid_stats
+            stoich_stats[stoich] = (
+                total_rate = stats.total_rate,
+                avg_rate = stats.avg_rate,
+                rate_var = stats.rate_var,
+                count = stats.count
+            )
+        end
+    else
+        # Traditional reaction extraction
+        significant_stoich, grouped_reactions, stoich_stats = extract_reactions_with_conservation(
+            G, selected_states, species_names, apply_conservation=use_constrained_dmd
+        )
+    end
     
     # Check for expected MM reactions
     println("\n" * "="^30)
@@ -493,6 +541,7 @@ function run_mm_inference(n_trajs=500, max_states=500; use_constrained_dmd=true,
         "dt" => dt,
         "species_names" => species_names,
         "constrained" => use_constrained_dmd,
+        "multigrid_used" => use_multigrid_results,
         "sparsity_param" => λ_sparse,
         "recovery_rate" => recovery_rate,
         "unphysical_count" => unphysical_found
