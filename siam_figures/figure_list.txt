@@ -1,0 +1,8 @@
+SIAM Publication Figures
+========================
+Figure 1: fig1_eigenvalue_spectrum.png
+Figure 2: fig2_flow_evolution.png
+Figure 3: fig3a_flow_field_S_SE.png
+Figure 4: fig3b_flow_field_E_P.png
+Figure 5: fig4_mm_signature.png
+Figure 6: fig5_reachability_matrix.png
