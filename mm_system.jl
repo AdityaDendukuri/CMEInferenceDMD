@@ -55,7 +55,7 @@ function get_mm_system_params()
     return Dict(
         "n_species" => 4,
         "species_names" => ["S", "E", "SE", "P"],
-        "time_range" => (0.0, 200.0),  # Match trajectory generation span
+        "time_range" => (0.0, 50.0),  # Analysis window, not trajectory span
         "expected_reactions" => [
             [-1, -1, 1, 0],   # S + E → SE
             [1, 1, -1, 0],    # SE → S + E  
@@ -346,6 +346,16 @@ function run_mm_analysis(analysis_params=Dict())
         data_dict["species_names"]
     )
     
+    # Step 2.5: Mechanistic Flow Analysis
+println("\n🌊 STEP 2.5: Mechanistic Flow Analysis")
+system_params = get_mm_system_params()
+flow_results = run_mechanistic_flow_analysis(
+    data_dict["selected_states"],
+    data_dict["probability_matrix"], 
+    data_dict["time_points"],
+    system_params["expected_reactions"]
+)
+
     # Step 4: Kinetics Analysis
     println("\n⚗️ STEP 4: Kinetics Analysis")
     kinetics_results = run_kinetics_analysis(

@@ -266,6 +266,21 @@ function run_basic_data_processing(trajectory_generator, system_params, analysis
     # Convert to matrix format
     println("\n4. Converting to matrix format...")
     prob_matrix = convert_histograms_to_matrix(histograms, selected_states)
+
+    # DEBUG: Check probability matrix changes (key for DMD rate recovery)
+    println("\n🔧 PROBABILITY MATRIX RATE DEBUG:")
+    println("  Matrix shape: $(size(prob_matrix))")
+    println("  Column sums (should be ~1.0): $(round.(sum(prob_matrix, dims=1)[1:5], digits=4))")
+    println("  Probability changes between time points (these drive DMD rates):")
+    max_changes = []
+    for t in 1:min(5, size(prob_matrix, 2)-1)
+        max_change = maximum(abs.(prob_matrix[:, t+1] - prob_matrix[:, t]))
+        avg_change = mean(abs.(prob_matrix[:, t+1] - prob_matrix[:, t]))
+        push!(max_changes, max_change)
+        println("    t$t → t$(t+1): max change = $(round(max_change, digits=6)), avg change = $(round(avg_change, digits=6))")
+    end
+    println("  Overall max probability change: $(maximum(max_changes))")
+    println("  Expected: For MM kinetics with dt=$(time_points[2]-time_points[1]), expect changes ~0.01-0.1")
     
     # Diagnose data quality
     println("\n5. Diagnosing data quality...")
